@@ -4,6 +4,7 @@ import type { StringValue } from 'ms'
 import type { CodecMap } from '../codec.js'
 import type { TopicPartitionSession } from '../partition-session.js'
 import type { TX } from '../tx.js'
+import type { TopicTxReadOffsets } from './_tx_read_offsets.js'
 
 export type TopicReaderSource = {
 	/**
@@ -130,8 +131,9 @@ export type TopicBaseReaderState = {
 export type TopicTxReaderState = TopicBaseReaderState & {
 	readonly tx: TX
 	readonly options: TopicReaderOptions
-	// Transaction support - track read offsets for commit hook
-	readonly readOffsets: Map<bigint, { firstOffset: bigint; lastOffset: bigint }> // partitionSessionId -> first and last read offsets
+	// Transaction support - track read offsets for commit hook.
+	// Keyed by a stable (topicPath, partitionId) tuple, not by partition session id.
+	readonly readOffsets: TopicTxReadOffsets
 }
 
 export type TopicCommitPromise = {

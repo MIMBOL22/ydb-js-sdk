@@ -1,11 +1,13 @@
 import * as assert from 'node:assert'
+import { create } from '@bufbuild/protobuf'
+import { Codec, StreamReadMessage_CommitOffsetResponseSchema } from '@ydbjs/api/topic'
 import { test } from 'vitest'
-import { Codec } from '@ydbjs/api/topic'
 
 import { TopicPartitionSession } from '../partition-session.js'
 import { TopicMessage } from '../message.js'
 import { AsyncPriorityQueue } from '../queue.js'
 import { _commit } from './_commit.js'
+import { _on_commit_offset_response } from './_commit_offset_response.js'
 import type { TopicReaderState } from './types.js'
 
 /**
@@ -41,6 +43,21 @@ function createMessage(partitionSession: TopicPartitionSession, offset: bigint):
 		seqNo: 1n,
 		offset,
 	})
+}
+
+/**
+ * Simulates a server acknowledgement for a single partition.
+ */
+function ack(state: TopicReaderState, partitionSessionId: bigint, committedOffset: bigint): void {
+	_on_commit_offset_response(
+		{
+			pendingCommits: state.pendingCommits,
+			partitionSessions: state.partitionSessions,
+		},
+		create(StreamReadMessage_CommitOffsetResponseSchema, {
+			partitionsCommittedOffsets: [{ partitionSessionId, committedOffset }],
+		})
+	)
 }
 
 // https://github.com/ydb-platform/ydb-js-sdk/issues/552
@@ -98,4 +115,97 @@ test('updates nextCommitStartOffset after commit', async () => {
 	_commit(state, message2)
 
 	assert.strictEqual(partitionSession.nextCommitStartOffset, 52n)
+})
+
+// A multi-partition commit must not resolve until the server acknowledges
+// every partition, otherwise callers may treat a partially committed batch
+// as fully committed.
+test('resolves commit only after every partition is acknowledged', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	let observedStatus: 'pending' | 'fulfilled' | 'rejected' = 'pending'
+	let observer = commitPromise.then(
+		() => {
+			observedStatus = 'fulfilled'
+			return 'fulfilled' as const
+		},
+		() => {
+			observedStatus = 'rejected'
+			return 'rejected' as const
+		}
+	)
+
+	ack(state, 1n, 1n)
+	// Drain the microtask queue: the first acknowledgement alone must leave the
+	// aggregate pending.
+	await Promise.resolve()
+	await Promise.resolve()
+	assert.strictEqual(observedStatus, 'pending')
+	assert.strictEqual(state.pendingCommits.has(2n), true)
+	assert.strictEqual(state.pendingCommits.has(1n), false)
+
+	ack(state, 2n, 1n)
+	assert.strictEqual(await observer, 'fulfilled')
+	assert.strictEqual(observedStatus, 'fulfilled')
+	assert.strictEqual(state.pendingCommits.size, 0)
+})
+
+// A failure on any partition while others are still pending must reject the
+// aggregate instead of waiting forever.
+test('rejects commit when one partition fails', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	let failure = new Error('partition session stopped')
+	for (let commit of state.pendingCommits.get(2n) ?? []) {
+		commit.reject(failure)
+	}
+
+	await assert.rejects(commitPromise, /partition session stopped/)
+
+	// The remaining partition is still allowed to settle without unhandled rejections.
+	ack(state, 1n, 1n)
+})
+
+// A partition can fail after another one was already acknowledged. The
+// aggregate must still reject rather than resolve with a partial commit.
+test('rejects commit when a partition fails after an acknowledgement', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	ack(state, 1n, 1n)
+	await Promise.resolve()
+	await Promise.resolve()
+
+	let failure = new Error('second partition failed')
+	for (let commit of state.pendingCommits.get(2n) ?? []) {
+		commit.reject(failure)
+	}
+
+	await assert.rejects(commitPromise, /second partition failed/)
 })
