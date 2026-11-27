@@ -137,6 +137,77 @@ test('writes and reads in tx', async () => {
 	])
 })
 
+test('keeps offsets when the tx reader is closed before commit', async () => {
+	await using yql = query(driver)
+
+	await using writer = createTopicWriter(driver, {
+		topic: testTopicName,
+		producer: testProducerName,
+	})
+
+	// Write two messages outside of a transaction (1, 2)
+	writer.write(Buffer.from('first', 'utf-8'), { seqNo: 1n })
+	writer.write(Buffer.from('second', 'utf-8'), { seqNo: 2n })
+	await writer.close()
+
+	await yql.begin({ idempotent: true }, async (tx) => {
+		let readerTx = createTopicTxReader(tx, driver, {
+			topic: testTopicName,
+			consumer: testConsumerName,
+		})
+
+		// Read only the first message (offset 0) inside the transaction.
+		let batchInsideTx: TopicMessage[] | undefined
+		for await (let batch of readerTx.read({
+			limit: 1,
+			signal: AbortSignal.timeout(5000),
+		})) {
+			batchInsideTx = batch
+			break
+		}
+
+		expect(batchInsideTx).toStrictEqual([
+			expect.objectContaining({
+				seqNo: 1n,
+				offset: 0n,
+				payload: Buffer.from('first', 'utf-8'),
+			}),
+		])
+
+		// Disposing the reader must not drop the delivered offset: the
+		// transaction pre-commit hook still has to stage it.
+		await readerTx.close()
+	})
+
+	await using reader = createTopicReader(driver, {
+		topic: testTopicName,
+		consumer: testConsumerName,
+	})
+
+	// The transaction staged offset 0, so the same consumer must receive the
+	// NEXT message (offset 1) first. A timeout or redelivery of offset 0 fails
+	// this test: the read must yield the next message within the deadline.
+	let messagesOutsideTx: TopicMessage[] = []
+	for await (let batch of reader.read({
+		limit: 1,
+		signal: AbortSignal.timeout(5000),
+	})) {
+		messagesOutsideTx.push(...batch)
+	}
+
+	expect(
+		messagesOutsideTx.length,
+		'timed out waiting for the next message after the transactional read'
+	).toBeGreaterThan(0)
+	expect(messagesOutsideTx[0]).toStrictEqual(
+		expect.objectContaining({
+			seqNo: 2n,
+			offset: 1n,
+			payload: Buffer.from('second', 'utf-8'),
+		})
+	)
+})
+
 test('rollbacks reads', async () => {
 	await using yql = query(driver)
 
@@ -207,7 +278,9 @@ test('rollbacks writes', async () => {
 			})
 
 			// Write a message inside the transaction (2)
-			writerTx.write(Buffer.from('written in tx', 'utf-8'), { seqNo: 2n })
+			writerTx.write(Buffer.from('written in tx', 'utf-8'), {
+				seqNo: 2n,
+			})
 			await writerTx.flush()
 
 			// Simulate a transaction failure. User error is always non-retriable.

@@ -11,7 +11,8 @@ import { create } from '@bufbuild/protobuf'
 import type { Driver } from '@ydbjs/core'
 import { loggers } from '@ydbjs/debug'
 import type { TX } from '../tx.js'
-import type { TopicPartitionSession } from '../partition-session.js'
+import type { TopicTxOffsetRange, TopicTxReadOffsetUpdate } from './_tx_read_offsets.js'
+import type { TopicTxIdentity } from './_tx_reader_registry.js'
 
 let dbg = loggers.topic.extend('reader')
 
@@ -19,58 +20,67 @@ export let _update_offsets_in_transaction = async function updateOffsetsInTransa
 	tx: TX,
 	driver: Driver,
 	consumer: string,
-	updates: Array<{
-		partitionSession: TopicPartitionSession
-		offsetRange: { firstOffset: bigint; lastOffset: bigint }
-	}>
+	updates: TopicTxReadOffsetUpdate[],
+	identity?: TopicTxIdentity,
+	signal?: AbortSignal
 ): Promise<void> {
 	if (updates.length === 0) {
 		dbg.log('no offsets to update in transaction')
 		return
 	}
 
-	// Group updates by topic path
+	// Group updates by topic path and partition id. Partition identity is the
+	// stable (topicPath, partitionId) pair; it does not depend on a live stream
+	// partition session, so offsets can be staged after reconnects and stops.
 	let topicMap = new Map<
 		string,
 		{
 			path: string
-			partitions: Array<{
-				partitionId: bigint
-				offsetRange: { firstOffset: bigint; lastOffset: bigint }
-			}>
+			partitions: Map<bigint, TopicTxOffsetRange>
 		}
 	>()
 
 	for (let update of updates) {
-		let topicPath = update.partitionSession.topicPath
-		let topicEntry = topicMap.get(topicPath)
+		let topicEntry = topicMap.get(update.topicPath)
 		if (!topicEntry) {
-			topicEntry = { path: topicPath, partitions: [] }
-			topicMap.set(topicPath, topicEntry)
+			topicEntry = { path: update.topicPath, partitions: new Map() }
+			topicMap.set(update.topicPath, topicEntry)
 		}
-		topicEntry.partitions.push({
-			partitionId: update.partitionSession.partitionId,
-			offsetRange: update.offsetRange,
-		})
+
+		// One contiguous range per partition: YDB aborts the commit when the
+		// request contains disjoint ranges. `collectTxReadOffsetUpdates` rejects
+		// non-contiguous delivery before this function is called.
+		topicEntry.partitions.set(update.partitionId, update.range)
 	}
 
-	// Build the request
+	if (topicMap.size === 0) {
+		dbg.log('no offsets to update in transaction')
+		return
+	}
+
+	// Build the request with a single `[start, end)` range per partition.
+	// Prefer the identity captured when the reader was created: a shared query
+	// client mutates `tx.sessionId`/`tx.transactionId` when another transaction
+	// begins on the same callable.
+	let sessionId = identity?.sessionId ?? tx.sessionId
+	let transactionId = identity?.transactionId ?? tx.transactionId
+
 	let topics = Array.from(topicMap.values())
 	let request = create(UpdateOffsetsInTransactionRequestSchema, {
 		tx: create(TransactionIdentitySchema, {
-			id: tx.transactionId,
-			session: tx.sessionId,
+			id: transactionId,
+			session: sessionId,
 		}),
 		topics: topics.map((topic) =>
 			create(UpdateOffsetsInTransactionRequest_TopicOffsetsSchema, {
 				path: topic.path,
-				partitions: topic.partitions.map((partition) =>
+				partitions: Array.from(topic.partitions.entries()).map(([partitionId, range]) =>
 					create(UpdateOffsetsInTransactionRequest_TopicOffsets_PartitionOffsetsSchema, {
-						partitionId: partition.partitionId,
+						partitionId,
 						partitionOffsets: [
 							create(OffsetsRangeSchema, {
-								start: partition.offsetRange.firstOffset,
-								end: partition.offsetRange.lastOffset + 1n, // exclusive end
+								start: range.start,
+								end: range.end, // exclusive end
 							}),
 						],
 					})
@@ -83,12 +93,15 @@ export let _update_offsets_in_transaction = async function updateOffsetsInTransa
 	dbg.log(
 		'sending updateOffsetsInTransaction request for %d topics, %d total partitions',
 		topics.length,
-		topics.reduce((sum, t) => sum + t.partitions.length, 0)
+		topics.reduce((sum, topic) => sum + topic.partitions.size, 0)
 	)
 
-	// Send the request
+	// Send the request. Any failure is propagated to the pre-commit hook so the
+	// transaction cannot commit without its delivered offsets.
 	let client = driver.createClient(TopicServiceDefinition)
-	let response = await client.updateOffsetsInTransaction(request)
+	let response = signal
+		? await client.updateOffsetsInTransaction(request, { signal })
+		: await client.updateOffsetsInTransaction(request)
 
 	if (response.operation?.ready === false) {
 		throw new Error('UpdateOffsetsInTransaction operation is not ready')

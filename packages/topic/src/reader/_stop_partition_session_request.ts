@@ -21,6 +21,7 @@ export let _on_stop_partition_session_request = async function on_stop_partition
 		readonly disposed: boolean
 		readonly onPartitionSessionStop?: onPartitionSessionStopCallback
 		readonly pendingCommits?: Map<bigint, TopicCommitPromise[]> // Optional for regular reader
+		readonly commitTimeoutMs?: number
 	},
 	input: StreamReadMessage_StopPartitionSessionRequest
 ): Promise<void> {
@@ -86,15 +87,61 @@ export let _on_stop_partition_session_request = async function on_stop_partition
 		return
 	}
 
-	// Handle graceful stop with pending commits (only for regular reader)
+	// Handle graceful stop with pending commits (only for regular reader).
+	// Keep draining commits accepted while we wait, until one shared deadline.
 	if (ctx.pendingCommits && ctx.pendingCommits.has(partitionSession.partitionSessionId)) {
-		await Promise.race([
-			Promise.all(ctx.pendingCommits.get(partitionSession.partitionSessionId)!),
-			once(AbortSignal.timeout(30_000), 'abort'),
-		])
+		let deadline = Date.now() + (ctx.commitTimeoutMs ?? 30_000)
+
+		while (true) {
+			let pending = ctx.pendingCommits.get(partitionSession.partitionSessionId)
+			if (!pending || pending.length === 0) {
+				break
+			}
+
+			let snapshot = pending.slice()
+			let remaining = deadline - Date.now()
+			if (remaining <= 0) {
+				break
+			}
+
+			// allSettled: a commit rejected by reconnect/destroy must not turn
+			// this detached stop handler into an unhandled rejection.
+			// oxlint-disable-next-line no-await-in-loop
+			let outcome = await Promise.race([
+				Promise.allSettled(snapshot.map((commit) => commit.promise)).then(
+					() => 'settled' as const
+				),
+				once(AbortSignal.timeout(remaining), 'abort').then(() => 'timeout' as const),
+			])
+
+			if (outcome === 'timeout') {
+				break
+			}
+
+			let after = ctx.pendingCommits.get(partitionSession.partitionSessionId)
+			if (!after || after.length === 0) {
+				break
+			}
+
+			// No new commits were accepted while draining the snapshot.
+			if (
+				after.length === snapshot.length &&
+				after.every((commit, index) => commit === snapshot[index])
+			) {
+				break
+			}
+		}
 	}
 
+	// The stream may have been disposed or this partition replaced during the
+	// drain (reconnect/destroy); do not send a response into a dead stream.
 	if (ctx.disposed) {
+		return
+	}
+	if (ctx.partitionSessions.get(partitionSession.partitionSessionId) !== partitionSession) {
+		return
+	}
+	if (partitionSession.isStopped || partitionSession.isEnded) {
 		return
 	}
 
@@ -107,8 +154,13 @@ export let _on_stop_partition_session_request = async function on_stop_partition
 		ctx.pendingCommits.delete(partitionSession.partitionSessionId)
 	}
 
-	_send_stop_partition_session_response({
-		queue: ctx.outgoingQueue,
-		partitionSessionId: partitionSession.partitionSessionId,
-	})
+	try {
+		_send_stop_partition_session_response({
+			queue: ctx.outgoingQueue,
+			partitionSessionId: partitionSession.partitionSessionId,
+		})
+	} catch (error) {
+		// Queue may be closed by a concurrent reconnect/destroy.
+		dbg.log('stop partition session response skipped: %O', error)
+	}
 }
