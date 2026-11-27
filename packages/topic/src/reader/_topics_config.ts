@@ -71,7 +71,9 @@ export let _parse_topics_read_settings = function parse_topics_read_settings(
 						readFrom: parseTimestamp(topicSource.readFrom),
 					}),
 					...(topicSource.partitionIds && {
-						partitionIds: topicSource.partitionIds,
+						// Snapshot the array: later caller mutations must not change the
+						// stream settings or the subscription reserved for this reader.
+						partitionIds: [...topicSource.partitionIds],
 					}),
 				})
 			)

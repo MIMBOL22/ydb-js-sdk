@@ -120,7 +120,9 @@ export let _consume_stream = async function consume_stream(state: TopicReaderSta
 						}),
 					},
 					chunk.serverMessage.value
-				)
+				).catch((error) => {
+					dbg.log('start partition session handler failed: %O', error)
+				})
 			} else if (chunk.serverMessage.case === 'stopPartitionSessionRequest') {
 				void _on_stop_partition_session_request(
 					{
@@ -134,7 +136,9 @@ export let _consume_stream = async function consume_stream(state: TopicReaderSta
 						}),
 					},
 					chunk.serverMessage.value
-				)
+				).catch((error) => {
+					dbg.log('stop partition session handler failed: %O', error)
+				})
 			} else if (chunk.serverMessage.case === 'endPartitionSession') {
 				void _on_end_partition_session(
 					{

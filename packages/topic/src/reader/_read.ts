@@ -5,7 +5,9 @@ import { loggers } from '@ydbjs/debug'
 
 import { TopicMessage } from '../message.js'
 import { _send_read_request } from './_read_request.js'
+import { trackTxReadOffset } from './_tx_read_offsets.js'
 import type { TopicPartitionSession } from '../partition-session.js'
+import type { TopicTxReadOffsets } from './_tx_read_offsets.js'
 import type { CodecMap } from '../codec.js'
 import type { AsyncPriorityQueue } from '../queue.js'
 import type { StreamReadMessage_FromClient, StreamReadMessage_ReadResponse } from '@ydbjs/api/topic'
@@ -22,7 +24,8 @@ export let _read = function read(
 		readonly outgoingQueue: AsyncPriorityQueue<StreamReadMessage_FromClient>
 		readonly maxBufferSize: bigint
 		readonly freeBufferSize: bigint
-		readonly readOffsets?: Map<bigint, { firstOffset: bigint; lastOffset: bigint }> // Optional for transaction support
+		readonly readOffsets?: TopicTxReadOffsets // Optional for transaction support
+		readonly isCommitting?: () => boolean // Set once the tx commit hook has started
 		readonly updateFreeBufferSize: (releasedBytes: bigint) => void // Helper to update free buffer size
 	},
 	options: { limit?: number; waitMs?: number; signal?: AbortSignal } = {}
@@ -107,6 +110,13 @@ export let _read = function read(
 					return
 				}
 
+				// Do not hand out messages once the transaction commit hook has
+				// started: their offsets would be outside the staged snapshot.
+				if (ctx.isCommitting?.()) {
+					dbg.log('transaction is committing, returning')
+					return
+				}
+
 				// If the signal is already aborted, return
 				if (mergedSignal.aborted) {
 					dbg.log('signal aborted during iteration, returning')
@@ -120,6 +130,10 @@ export let _read = function read(
 				}
 
 				let messages: TopicMessage[] = []
+				let trackedOffsets: Array<{
+					partitionSession: TopicPartitionSession
+					offset: bigint
+				}> = []
 
 				// Wait for the next readResponse or until the timeout expires.
 				if (!ctx.buffer.length) {
@@ -289,19 +303,14 @@ export let _read = function read(
 									}),
 								})
 
-								// Track read offset for transaction support
+								// Defer offset tracking until this batch is actually yielded:
+								// if a later message in the same batch fails to decode, the
+								// caller never receives these messages.
 								if (ctx.readOffsets) {
-									let existing = ctx.readOffsets.get(pd.partitionSessionId)
-									if (existing) {
-										// Update last offset, keep first offset
-										existing.lastOffset = msg.offset
-									} else {
-										// First message for this partition session
-										ctx.readOffsets.set(pd.partitionSessionId, {
-											firstOffset: msg.offset,
-											lastOffset: msg.offset,
-										})
-									}
+									trackedOffsets.push({
+										partitionSession,
+										offset: msg.offset,
+									})
 								}
 
 								messages.push(message)
@@ -372,6 +381,18 @@ export let _read = function read(
 				}
 
 				dbg.log('generator yielding: messagesCount=%d', messages.length)
+
+				if (ctx.isCommitting?.()) {
+					return
+				}
+
+				// Record offsets only for messages the caller is about to receive.
+				if (ctx.readOffsets) {
+					for (let tracked of trackedOffsets) {
+						trackTxReadOffset(ctx.readOffsets, tracked.partitionSession, tracked.offset)
+					}
+				}
+
 				yield messages
 
 				// If we've reached the limit or no messages were yielded and buffer is empty, return

@@ -64,10 +64,21 @@ export let _on_start_partition_session_request = async function on_start_partiti
 		}
 	}
 
-	_send_start_partition_session_response({
-		queue: ctx.outgoingQueue,
-		partitionSessionId: partitionSession.partitionSessionId,
-		readOffset,
-		commitOffset,
-	})
+	// The reader may have been closed or this session replaced while the
+	// onPartitionSessionStart callback was running.
+	if (ctx.partitionSessions.get(partitionSession.partitionSessionId) !== partitionSession) {
+		return
+	}
+
+	try {
+		_send_start_partition_session_response({
+			queue: ctx.outgoingQueue,
+			partitionSessionId: partitionSession.partitionSessionId,
+			readOffset,
+			commitOffset,
+		})
+	} catch (error) {
+		// Queue may be closed by a concurrent commit/reconnect/destroy.
+		dbg.log('start partition session response skipped: %O', error)
+	}
 }

@@ -1,11 +1,14 @@
 import * as assert from 'node:assert'
+import { create } from '@bufbuild/protobuf'
+import { Codec, StreamReadMessage_CommitOffsetResponseSchema } from '@ydbjs/api/topic'
 import { test } from 'vitest'
-import { Codec } from '@ydbjs/api/topic'
 
 import { TopicPartitionSession } from '../partition-session.js'
 import { TopicMessage } from '../message.js'
 import { AsyncPriorityQueue } from '../queue.js'
 import { _commit } from './_commit.js'
+import { _on_commit_offset_response } from './_commit_offset_response.js'
+import { _on_stop_partition_session_request } from './_stop_partition_session_request.js'
 import type { TopicReaderState } from './types.js'
 
 /**
@@ -41,6 +44,21 @@ function createMessage(partitionSession: TopicPartitionSession, offset: bigint):
 		seqNo: 1n,
 		offset,
 	})
+}
+
+/**
+ * Simulates a server acknowledgement for a single partition.
+ */
+function ack(state: TopicReaderState, partitionSessionId: bigint, committedOffset: bigint): void {
+	_on_commit_offset_response(
+		{
+			pendingCommits: state.pendingCommits,
+			partitionSessions: state.partitionSessions,
+		},
+		create(StreamReadMessage_CommitOffsetResponseSchema, {
+			partitionsCommittedOffsets: [{ partitionSessionId, committedOffset }],
+		})
+	)
 }
 
 // https://github.com/ydb-platform/ydb-js-sdk/issues/552
@@ -98,4 +116,214 @@ test('updates nextCommitStartOffset after commit', async () => {
 	_commit(state, message2)
 
 	assert.strictEqual(partitionSession.nextCommitStartOffset, 52n)
+})
+
+// A multi-partition commit must not resolve until the server acknowledges
+// every partition, otherwise callers may treat a partially committed batch
+// as fully committed.
+test('resolves commit only after every partition is acknowledged', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	let observedStatus: 'pending' | 'fulfilled' | 'rejected' = 'pending'
+	let observer = commitPromise.then(
+		() => {
+			observedStatus = 'fulfilled'
+			return 'fulfilled' as const
+		},
+		() => {
+			observedStatus = 'rejected'
+			return 'rejected' as const
+		}
+	)
+
+	ack(state, 1n, 1n)
+	// Drain the microtask queue: the first acknowledgement alone must leave the
+	// aggregate pending.
+	await Promise.resolve()
+	await Promise.resolve()
+	assert.strictEqual(observedStatus, 'pending')
+	assert.strictEqual(state.pendingCommits.has(2n), true)
+	assert.strictEqual(state.pendingCommits.has(1n), false)
+
+	ack(state, 2n, 1n)
+	assert.strictEqual(await observer, 'fulfilled')
+	assert.strictEqual(observedStatus, 'fulfilled')
+	assert.strictEqual(state.pendingCommits.size, 0)
+})
+
+// A failure on any partition while others are still pending must reject the
+// aggregate instead of waiting forever.
+test('rejects commit when one partition fails', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	let failure = new Error('partition session stopped')
+	for (let commit of state.pendingCommits.get(2n) ?? []) {
+		commit.reject(failure)
+	}
+
+	await assert.rejects(commitPromise, /partition session stopped/)
+
+	// The remaining partition is still allowed to settle without unhandled rejections.
+	ack(state, 1n, 1n)
+})
+
+// A partition can fail after another one was already acknowledged. The
+// aggregate must still reject rather than resolve with a partial commit.
+test('rejects commit when a partition fails after an acknowledgement', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+
+	ack(state, 1n, 1n)
+	await Promise.resolve()
+	await Promise.resolve()
+
+	let failure = new Error('second partition failed')
+	for (let commit of state.pendingCommits.get(2n) ?? []) {
+		commit.reject(failure)
+	}
+
+	await assert.rejects(commitPromise, /second partition failed/)
+})
+
+function stopCtx(state: TopicReaderState, commitTimeoutMs = 1000): any {
+	return {
+		partitionSessions: state.partitionSessions,
+		outgoingQueue: state.outgoingQueue,
+		buffer: state.buffer,
+		disposed: false,
+		pendingCommits: state.pendingCommits,
+		commitTimeoutMs,
+	}
+}
+
+function gracefulStop(partitionSessionId: bigint): any {
+	return { partitionSessionId, committedOffset: 0n, graceful: true }
+}
+
+// Graceful stop must wait on the actual per-partition promises. Previously it
+// passed commit records to Promise.all, resolved immediately and rejected an
+// ACK that was about to arrive.
+test('graceful stop waits for a partition acknowledgement', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+	ack(state, 1n, 1n)
+
+	let stopPromise = _on_stop_partition_session_request(stopCtx(state), gracefulStop(2n))
+
+	// Let a broken implementation resume and reject prematurely.
+	await new Promise((resolve) => setTimeout(resolve, 0))
+
+	ack(state, 2n, 1n)
+	await stopPromise
+	await assert.doesNotReject(commitPromise)
+})
+
+test('graceful stop rejects after the deadline without an acknowledgement', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let second = new TopicPartitionSession(2n, 1n, '/test/topic')
+	let state = createMockState(
+		new Map([
+			[1n, first],
+			[2n, second],
+		])
+	)
+
+	let commitPromise = _commit(state, [createMessage(first, 0n), createMessage(second, 0n)])
+	ack(state, 1n, 1n)
+
+	await _on_stop_partition_session_request(stopCtx(state, 20), gracefulStop(2n))
+
+	let error: unknown
+	try {
+		await commitPromise
+	} catch (reason) {
+		error = reason
+	}
+	assert.match(String(error), /Partition session stopped after timeout/)
+})
+
+// A reconnect/destroy may reject a pending commit while the detached stop
+// handler is draining. The handler must settle without surfacing an unhandled
+// rejection; the caller still observes the commit error.
+test('graceful stop drains a commit rejected by disconnect', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let state = createMockState(new Map([[1n, first]]))
+	let commitPromise = _commit(state, createMessage(first, 0n))
+
+	let stopPromise = _on_stop_partition_session_request(stopCtx(state), gracefulStop(1n))
+
+	for (let commit of state.pendingCommits.get(1n) ?? []) {
+		commit.reject('disconnected')
+	}
+
+	await stopPromise
+	await assert.rejects(commitPromise, /disconnected/)
+})
+
+// A commit accepted after the drain snapshot must be awaited too, as long as
+// its ACK arrives before the shared deadline.
+test('graceful stop drains a commit accepted while waiting', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let state = createMockState(new Map([[1n, first]]))
+	let firstCommit = _commit(state, createMessage(first, 0n))
+
+	let stopPromise = _on_stop_partition_session_request(stopCtx(state, 500), gracefulStop(1n))
+	await Promise.resolve()
+
+	let secondCommit = _commit(state, createMessage(first, 1n))
+	ack(state, 1n, 1n) // resolves the snapshot, second commit is still pending
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	ack(state, 1n, 2n) // arrives during the extended drain
+
+	await stopPromise
+	await assert.doesNotReject(firstCommit)
+	await assert.doesNotReject(secondCommit)
+})
+
+test('graceful stop rejects commits still pending after the deadline', async () => {
+	let first = new TopicPartitionSession(1n, 0n, '/test/topic')
+	let state = createMockState(new Map([[1n, first]]))
+	let firstCommit = _commit(state, createMessage(first, 0n))
+
+	let stopPromise = _on_stop_partition_session_request(stopCtx(state, 20), gracefulStop(1n))
+	await Promise.resolve()
+	let secondCommit = _commit(state, createMessage(first, 1n))
+
+	await stopPromise
+	await assert.rejects(firstCommit, /timeout during graceful stop/)
+	await assert.rejects(secondCommit, /timeout during graceful stop/)
 })

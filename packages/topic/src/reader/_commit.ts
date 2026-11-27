@@ -129,24 +129,31 @@ export let _commit = function commit(
 		0
 	)
 
-	// Create a promise that resolves when the commit is acknowledged by the server.
-	return new Promise((resolve, reject) => {
-		for (let [partitionSessionId, partOffsets] of offsets.entries()) {
-			// Create a commit promise for each partition session
-			let commitPromise: TopicCommitPromise = {
-				partitionSessionId,
-				offset: partOffsets[partOffsets.length - 1]!.end, // Use the last offset in the range
-				resolve,
-				reject,
-			}
+	// Create one promise per partition session and resolve the aggregate only
+	// after every partition has been acknowledged by the server.
+	let partitions: Promise<void>[] = []
 
-			// Add to pending commits map
-			if (!state.pendingCommits.has(partitionSessionId)) {
-				state.pendingCommits.set(partitionSessionId, [])
-			}
+	for (let [partitionSessionId, partOffsets] of offsets.entries()) {
+		let deferred = Promise.withResolvers<void>()
 
-			// Push the commit promise to the pending commits for this partition session
-			state.pendingCommits.get(partitionSessionId)!.push(commitPromise)
+		// Create a commit promise for each partition session
+		let commitPromise: TopicCommitPromise = {
+			partitionSessionId,
+			offset: partOffsets[partOffsets.length - 1]!.end, // Use the last offset in the range
+			promise: deferred.promise,
+			resolve: deferred.resolve,
+			reject: deferred.reject,
 		}
-	})
+
+		// Add to pending commits map
+		if (!state.pendingCommits.has(partitionSessionId)) {
+			state.pendingCommits.set(partitionSessionId, [])
+		}
+
+		// Push the commit promise to the pending commits for this partition session
+		state.pendingCommits.get(partitionSessionId)!.push(commitPromise)
+		partitions.push(deferred.promise)
+	}
+
+	return Promise.all(partitions).then(() => undefined)
 }

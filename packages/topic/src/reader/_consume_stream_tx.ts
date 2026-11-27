@@ -25,10 +25,6 @@ export let _consume_stream_tx = async function consume_stream_tx(
 	let signal = state.controller.signal
 	await state.driver.ready(signal)
 
-	state.tx.onRollback((reason) => {
-		state.controller.abort(reason)
-	})
-
 	await retry({ ...defaultRetryConfig, signal }, async (signal) => {
 		state.outgoingQueue.close()
 		state.outgoingQueue.reset()
@@ -58,9 +54,6 @@ export let _consume_stream_tx = async function consume_stream_tx(
 
 			state.partitionSessions.clear()
 		}
-
-		// Clear read offsets for transaction reader
-		state.readOffsets.clear()
 
 		let stream = state.driver
 			.createClient(TopicServiceDefinition)
@@ -111,7 +104,9 @@ export let _consume_stream_tx = async function consume_stream_tx(
 						}),
 					},
 					chunk.serverMessage.value
-				)
+				).catch((error) => {
+					dbg.log('start partition session handler failed: %O', error)
+				})
 			} else if (chunk.serverMessage.case === 'stopPartitionSessionRequest') {
 				void _on_stop_partition_session_request(
 					{
@@ -124,7 +119,9 @@ export let _consume_stream_tx = async function consume_stream_tx(
 						}),
 					},
 					chunk.serverMessage.value
-				)
+				).catch((error) => {
+					dbg.log('stop partition session handler failed: %O', error)
+				})
 			} else if (chunk.serverMessage.case === 'endPartitionSession') {
 				void _on_end_partition_session(
 					{

@@ -167,9 +167,12 @@ await writer.flush()
 
 ## Transactions
 
-Run topic reads/writes inside an @ydbjs/query transaction handler and pass the `tx` object that it provides. Do not use `using`/explicit close inside the transaction — TopicTxReader/Writer are wired to `tx` hooks and clean up automatically.
+Run topic reads/writes inside an @ydbjs/query transaction handler and pass the `tx` object that it provides. Topic readers/writers are wired to `tx` hooks and clean up automatically. Closing a transactional reader explicitly only stops delivery: already delivered offsets are kept and staged when the transaction commits.
 
 - Reader: `createTopicTxReader(tx, driver, { topic, consumer })` or `t.createTxReader(tx, { ... })`. The reader tracks read offsets and issues `updateOffsetsInTransaction` on commit.
+  - One transactional reader is allowed per transaction identity + consumer + topic/partition set. Overlapping subscriptions are rejected; to read several topics with one consumer, pass an array to a single reader (`topic: ['/a', '/b']`).
+  - Delivered offsets must be contiguous. A seek/gap that leaves a hole makes the commit fail closed instead of sending disjoint ranges (YDB aborts such commits with `ThereAreGapsInTheOffsetRanges`). Up to 64 ranges per partition are tracked; beyond that the commit also fails.
+  - Closing the reader or a stream shutdown does not drop delivered offsets; they are staged on commit and cleared on rollback/close. Reads stop synchronously when the commit hook starts, so a message cannot be delivered after the offset snapshot.
 - Writer: `createTopicTxWriter(tx, driver, { topic, ... })` or `t.createTxWriter(tx, { ... })`. The writer flushes before commit.
 
 ```ts

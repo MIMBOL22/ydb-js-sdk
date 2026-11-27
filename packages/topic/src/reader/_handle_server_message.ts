@@ -20,6 +20,7 @@ export let _handle_server_message = async function handle_server_message(
 		readonly buffer: import('@ydbjs/api/topic').StreamReadMessage_ReadResponse[]
 		readonly partitionSessions: Map<bigint, TopicPartitionSession>
 		readonly pendingCommits: Map<bigint, TopicCommitPromise[]>
+		readonly commitTimeoutMs?: number
 		disposed: boolean
 		readMore: (bytes: bigint) => void
 		onError?: (error: unknown) => void
@@ -169,13 +170,54 @@ export let _handle_server_message = async function handle_server_message(
 		}
 
 		if (ctx.pendingCommits.has(partitionSession.partitionSessionId)) {
-			await Promise.race([
-				Promise.all(ctx.pendingCommits.get(partitionSession.partitionSessionId)!),
-				once(AbortSignal.timeout(30_000), 'abort'),
-			])
+			let deadline = Date.now() + (ctx.commitTimeoutMs ?? 30_000)
+
+			while (true) {
+				let pending = ctx.pendingCommits.get(partitionSession.partitionSessionId)
+				if (!pending || pending.length === 0) {
+					break
+				}
+
+				let snapshot = pending.slice()
+				let remaining = deadline - Date.now()
+				if (remaining <= 0) {
+					break
+				}
+
+				// allSettled: reconnect/destroy may reject a pending commit while
+				// this detached handler is draining.
+				// oxlint-disable-next-line no-await-in-loop
+				let outcome = await Promise.race([
+					Promise.allSettled(snapshot.map((commit) => commit.promise)).then(
+						() => 'settled' as const
+					),
+					once(AbortSignal.timeout(remaining), 'abort').then(() => 'timeout' as const),
+				])
+
+				if (outcome === 'timeout') {
+					break
+				}
+
+				let after = ctx.pendingCommits.get(partitionSession.partitionSessionId)
+				if (!after || after.length === 0) {
+					break
+				}
+				if (
+					after.length === snapshot.length &&
+					after.every((commit, index) => commit === snapshot[index])
+				) {
+					break
+				}
+			}
 		}
 
 		if (ctx.disposed) {
+			return
+		}
+		if (ctx.partitionSessions.get(partitionSession.partitionSessionId) !== partitionSession) {
+			return
+		}
+		if (partitionSession.isStopped || partitionSession.isEnded) {
 			return
 		}
 
@@ -188,10 +230,14 @@ export let _handle_server_message = async function handle_server_message(
 			ctx.pendingCommits.delete(partitionSession.partitionSessionId)
 		}
 
-		_send_stop_partition_session_response({
-			queue: ctx.outgoingQueue,
-			partitionSessionId: partitionSession.partitionSessionId,
-		})
+		try {
+			_send_stop_partition_session_response({
+				queue: ctx.outgoingQueue,
+				partitionSessionId: partitionSession.partitionSessionId,
+			})
+		} catch (error) {
+			dbg.log('stop partition session response skipped: %O', error)
+		}
 	}
 
 	if (message.serverMessage.case === 'endPartitionSession') {

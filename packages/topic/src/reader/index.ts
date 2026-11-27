@@ -19,6 +19,12 @@ import { _consume_stream_tx } from './_consume_stream_tx.js'
 import { _read } from './_read.js'
 import { _commit } from './_commit.js'
 import { _update_offsets_in_transaction } from './_update_offsets_in_transaction.js'
+import { collectTxReadOffsetUpdates } from './_tx_read_offsets.js'
+import {
+	type TopicTxIdentity,
+	releaseTxReaderSubscriptions,
+	reserveTxReaderSubscriptions,
+} from './_tx_reader_registry.js'
 import {
 	_create_disposal_functions,
 	_initialize_codecs,
@@ -202,13 +208,24 @@ export const createTopicTxReader = function createTopicTxReader(
 	driver: Driver,
 	options: TopicReaderOptions
 ): TopicTxReader {
-	options.updateTokenIntervalMs ??= 60_000 // Default is 60 seconds.
+	// Capture the identity before any mutable TX field can be overwritten by
+	// another transaction on the same query client.
+	let txIdentity: TopicTxIdentity = {
+		sessionId: tx.sessionId,
+		transactionId: tx.transactionId,
+	}
+
+	// Snapshot the caller's options: later mutations of the original object must
+	// not change what this reader stages or which consumer claim it releases.
+	let consumer = options.consumer
+	let readerOptions: TopicReaderOptions = { ...options, consumer }
+	readerOptions.updateTokenIntervalMs ??= 60_000 // Default is 60 seconds.
 
 	let state: TopicTxReaderState = {
 		tx,
 		driver,
-		options,
-		topicsReadSettings: _parse_topics_read_settings(options.topic),
+		options: readerOptions,
+		topicsReadSettings: _parse_topics_read_settings(readerOptions.topic),
 
 		// Control
 		controller: new AbortController(),
@@ -226,69 +243,100 @@ export const createTopicTxReader = function createTopicTxReader(
 
 		// Transaction support - track read offsets for commit hook
 		readOffsets: new Map(),
+
+		// Set synchronously by the commit hook so a pending read cannot yield a
+		// message after the offset snapshot.
+		committing: false,
 	}
 
 	// Initialize custom codecs if provided
 	_initialize_codecs(state.codecs, options.codecMap)
 
-	// Register precommit hook to send updateOffsetsInTransaction
-	tx.onCommit(async () => {
-		let updates = []
+	// Reserve only after all synchronous initialization that can throw, so a
+	// failed construction does not leave a stale subscription claim behind.
+	let reservation = reserveTxReaderSubscriptions(txIdentity, consumer, state.topicsReadSettings)
 
-		for (let [partitionSessionId, offsetRange] of state.readOffsets) {
-			let partitionSession = state.partitionSessions.get(partitionSessionId)
-			if (partitionSession) {
-				updates.push({
-					partitionSession,
-					offsetRange,
-				})
+	try {
+		// Register precommit hook to send updateOffsetsInTransaction
+		tx.onCommit(async (signal) => {
+			// Stop new and pending reads BEFORE snapshotting: a message yielded
+			// after the snapshot would be delivered but never staged. Keep the
+			// transport open until staging finishes so in-flight partition
+			// callbacks cannot write into a closed queue.
+			state.committing = true
+
+			try {
+				// Stage every delivered range. Offset staging uses the stable
+				// (topicPath, partitionId) identity, so it does not depend on the local
+				// partition session still being alive after a reconnect.
+				let updates = collectTxReadOffsetUpdates(state.readOffsets)
+
+				dbg.log('Updating offsets in transaction for %d partitions', updates.length)
+
+				if (updates.length > 0) {
+					await _update_offsets_in_transaction(
+						tx,
+						state.driver,
+						consumer,
+						updates,
+						txIdentity,
+						signal
+					)
+				}
+			} finally {
+				// Close after staging on success and on failure.
+				closeWithReason('Transaction committed')
 			}
-		}
+		})
 
-		dbg.log('Updating offsets in transaction for %d partitions', updates.length)
+		tx.onRollback((error) => {
+			dbg.log('transaction rollback detected, closing tx reader: %O', error)
+			// The transaction is over and can no longer stage offsets; drop tracking
+			// only here, never on reader/stream disposal.
+			state.readOffsets.clear()
+			releaseTxReaderSubscriptions(txIdentity, consumer, reservation)
+			closeWithReason('Transaction rolled back', error)
+		})
 
-		if (updates.length > 0) {
-			await _update_offsets_in_transaction(tx, state.driver, state.options.consumer, updates)
-		}
+		tx.onClose(() => {
+			// The transaction is closed (committed or rolled back), so the tracked
+			// offsets are no longer needed.
+			state.readOffsets.clear()
+			releaseTxReaderSubscriptions(txIdentity, consumer, reservation)
 
-		closeWithReason('Transaction committed')
-	})
-
-	tx.onRollback((error) => {
-		dbg.log('transaction rollback detected, closing tx reader: %O', error)
-		closeWithReason('Transaction rolled back', error)
-	})
-
-	tx.onClose(() => {
-		if (state.disposed) {
-			return
-		}
-
-		dbg.log('transaction closed, disposing tx reader')
-		closeWithReason('Transaction closed')
-	})
-
-	// Start consuming the stream immediately.
-	void (async function stream() {
-		try {
-			await _consume_stream_tx(state)
-		} catch (error) {
-			if (!state.controller.signal.aborted) {
-				dbg.log('error occurred while streaming: %O', error)
+			if (state.disposed) {
+				return
 			}
-		} finally {
-			dbg.log('tx stream closed')
-			destroy(new Error('Stream closed'))
-		}
-	})()
 
-	// Update the token periodically to ensure that the reader has a valid token.
-	_start_background_token_refresher(
-		state.driver,
-		state.outgoingQueue,
-		options.updateTokenIntervalMs,
-		state.controller.signal
-	)
+			dbg.log('transaction closed, disposing tx reader')
+			closeWithReason('Transaction closed')
+		})
+
+		// Start consuming the stream immediately.
+		void (async function stream() {
+			try {
+				await _consume_stream_tx(state)
+			} catch (error) {
+				if (!state.controller.signal.aborted) {
+					dbg.log('error occurred while streaming: %O', error)
+				}
+			} finally {
+				dbg.log('tx stream closed')
+				destroy(new Error('Stream closed'))
+			}
+		})()
+
+		// Update the token periodically to ensure that the reader has a valid token.
+		_start_background_token_refresher(
+			state.driver,
+			state.outgoingQueue,
+			readerOptions.updateTokenIntervalMs,
+			state.controller.signal
+		)
+	} catch (error) {
+		releaseTxReaderSubscriptions(txIdentity, consumer, reservation)
+		throw error
+	}
 
 	function closeWithReason(reason: string, error?: unknown) {
 		if (state.disposed) {
@@ -308,7 +356,10 @@ export const createTopicTxReader = function createTopicTxReader(
 
 		state.disposed = true
 		state.outgoingQueue.dispose()
-		state.readOffsets.clear()
+		// Tracked read offsets are intentionally retained: an explicit reader
+		// close or a terminal stream shutdown must not prevent the transaction
+		// pre-commit hook from staging already delivered offsets. The map is
+		// cleared by the tx.onRollback / tx.onClose handlers.
 		state.partitionSessions.clear()
 		state.buffer.length = 0
 		state.controller.abort(reason)
@@ -327,6 +378,7 @@ export const createTopicTxReader = function createTopicTxReader(
 					maxBufferSize: state.maxBufferSize,
 					freeBufferSize: state.freeBufferSize,
 					readOffsets: state.readOffsets,
+					isCommitting: () => state.committing,
 					updateFreeBufferSize: (releasedBytes: bigint) => {
 						state.freeBufferSize += releasedBytes
 					},
