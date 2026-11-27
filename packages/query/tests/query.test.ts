@@ -6,7 +6,7 @@ import { fromJs } from '@ydbjs/value'
 import { Optional } from '@ydbjs/value/optional'
 import { Uint64, Uint64Type } from '@ydbjs/value/primitive'
 
-import { query } from '../src/index.js'
+import { type TX, query } from '../src/index.js'
 import { SessionBusyError } from '../src/session.js'
 
 function collectTrace(name: string): {
@@ -404,6 +404,45 @@ test('handles multiple concurrent transactions', async () => {
 	expect(results[0]).toEqual([[[{ id: 1 }]], [[{ id: 2 }]]])
 	expect(results[1]).toEqual([[[{ id: 3 }]], [[{ id: 4 }]]])
 	expect(results[2]).toEqual([[[{ id: 5 }]], [[{ id: 6 }]]])
+})
+
+// Each attempt must own its TX callable. Concurrent transactions on one client
+// previously shared the client-wide `yqlQuery` function via Object.assign, so
+// IDs and hook registrars were overwritten by whichever transaction began last.
+test('concurrent transactions receive distinct tx callables and hook arrays', async () => {
+	await using sql = query(driver, { poolOptions: { maxSize: 2 } })
+
+	let firstStarted = Promise.withResolvers<void>()
+	let secondStarted = Promise.withResolvers<void>()
+	let releaseFirst = Promise.withResolvers<void>()
+	let observed: TX[] = []
+
+	let first = sql.begin(async (tx) => {
+		observed.push(tx)
+		firstStarted.resolve()
+		await releaseFirst.promise
+		return { sessionId: tx.sessionId, transactionId: tx.transactionId }
+	})
+
+	await firstStarted.promise
+
+	let second = sql.begin(async (tx) => {
+		observed.push(tx)
+		secondStarted.resolve()
+		releaseFirst.resolve()
+		return { sessionId: tx.sessionId, transactionId: tx.transactionId }
+	})
+
+	await secondStarted.promise
+
+	let [firstIds, secondIds] = await Promise.all([first, second])
+	let [firstTx, secondTx] = observed as [TX, TX]
+
+	expect(firstTx).not.toBe(secondTx)
+	expect(firstTx.onCommit).not.toBe(secondTx.onCommit)
+	expect(firstTx.transactionId).toBe(firstIds.transactionId)
+	expect(secondTx.transactionId).toBe(secondIds.transactionId)
+	expect(firstIds.transactionId).not.toBe(secondIds.transactionId)
 })
 
 test('rejects parallel statements inside a single transaction with SessionBusyError', async () => {

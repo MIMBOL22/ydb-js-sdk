@@ -300,20 +300,30 @@ export function query(driver: Driver, options?: QueryOptions): QueryClient {
 
 			let committed = false
 			try {
-				let tx = Object.assign(yqlQuery, {
-					nodeId: session.nodeId,
-					sessionId: session.id,
-					transactionId: attemptStore.transactionId,
-					onRollback: (fn: () => Promise<void> | void) => {
-						rollbackHooks.push(fn)
-					},
-					onCommit: (fn: () => Promise<void> | void) => {
-						commitHooks.push(fn)
-					},
-					onClose: (fn: () => Promise<void> | void) => {
-						closeHooks.push(fn)
-					},
-				}) as TX
+				// Every attempt gets its own callable: concurrent transactions on one
+				// client must not share mutable IDs or hook registrars. The wrapper
+				// delegates to `yqlQuery`, which resolves the attempt store via
+				// AsyncLocalStorage.
+				let tx = Object.assign(
+					<TResult extends any[] = unknown[], TValues extends any[] = unknown[]>(
+						strings: string | TemplateStringsArray,
+						...values: TValues
+					) => yqlQuery<TValues, TResult>(strings, ...values),
+					{
+						nodeId: session.nodeId,
+						sessionId: session.id,
+						transactionId: attemptStore.transactionId,
+						onRollback: (fn: () => Promise<void> | void) => {
+							rollbackHooks.push(fn)
+						},
+						onCommit: (fn: () => Promise<void> | void) => {
+							commitHooks.push(fn)
+						},
+						onClose: (fn: () => Promise<void> | void) => {
+							closeHooks.push(fn)
+						},
+					}
+				) as TX
 
 				dbg.log('executing transaction body')
 				let result = await ctx.run(attemptStore, () => caller!(tx, signal))
