@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [22, 24]
 
     services:
       ydb:
@@ -60,7 +60,7 @@ jobs:
         env:
           YDB_ENABLE_COLUMN_TABLES: true
           YDB_USE_IN_MEMORY_PDISKS: true
-        options: '-h localhost'
+        options: "-h localhost"
 
     env:
       YDB_STATIC_CREDENTIALS_USER: root
